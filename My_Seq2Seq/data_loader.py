@@ -1,86 +1,96 @@
 import torch
-import numpy as np
 from torch.utils.data import Dataset, DataLoader
-from torch.nn.utils.rnn import pad_sequence
 
 from My_Seq2Seq.config import load_config
-from My_Seq2Seq.utils import english_tokenizer_load, chinese_tokenizer_load
 
 config = load_config()
-DEVICE = config.device
 
 
-class TranslateDataset(Dataset):
+class TranslationDataset(Dataset):
     def __init__(self, data_path):
-        self.out_en_sent, self.out_zh_sent = self.get_dataset(data_path, sort=True)
-        self.sp_en = english_tokenizer_load()
-        self.sp_zh = chinese_tokenizer_load()
-        self.PAD = self.sp_en.pad_id()  # 0
-        self.BOS = self.sp_en.bos_id()  # 2
-        self.EOS = self.sp_en.eos_id()  # 3
+        self.en_num_data, self.ch_num_data, self.en2id, \
+        self.id2en, self.ch2id, self.id2ch, self.basic_dict = self.build_data(data_path)
 
-    @staticmethod
-    def len_argsort(seq):
-        """传入一系列句子数据(分好词的列表形式)，按照句子长度排序后，返回排序后原来各句子在数据中的索引下标"""
-        return sorted(range(len(seq)), key=lambda x: len(seq[x]))
-
-    def get_dataset(self, data_path, sort=False):
-        """把中文和英文按照同样的顺序排序, 以英文句子长度排序的(句子下标)顺序为基准"""
-        # dataset = json.load(open(data_path, 'r', encoding='utf-8'))
-        dataset = []
-        with open(data_path, 'r', encoding='utf-8') as f:
-            for line in f.readlines():
-                en, zh = line.strip().split('\t')
-                dataset.append([en, zh])
-        out_en_sent = []
-        out_zh_sent = []
-        for idx, _ in enumerate(dataset):
-            out_en_sent.append(dataset[idx][0])
-            out_zh_sent.append(dataset[idx][1])
-        if sort:
-            sorted_index = self.len_argsort(out_en_sent)
-            out_en_sent = [out_en_sent[i] for i in sorted_index]
-            out_zh_sent = [out_zh_sent[i] for i in sorted_index]
-
-        return out_en_sent, out_zh_sent
-
-    def __getitem__(self, idx):
-        en_text = self.out_en_sent[idx]
-        zh_text = self.out_zh_sent[idx]
-        return [en_text, zh_text]
+        assert len(self.en_num_data) == len(self.ch_num_data)
 
     def __len__(self):
-        return len(self.out_en_sent)
+        return len(self.en_num_data)
 
-    def collate_fn(self, batch):
-        src_text = [x[0] for x in batch]
-        tgt_text = [x[1] for x in batch]
+    def __getitem__(self, idx):
+        src_sample = self.en_num_data[idx]
+        src_len = len(self.en_num_data[idx])
+        trg_sample = self.ch_num_data[idx]
+        trg_len = len(self.ch_num_data[idx])
+        return {"src": src_sample, "src_len": src_len, "trg": trg_sample, "trg_len": trg_len}
 
-        src_tokens = [[self.BOS] + self.sp_en.EncodeAsIds(sent) + [self.EOS] for sent in src_text]
-        tgt_tokens = [[self.BOS] + self.sp_zh.EncodeAsIds(sent) + [self.EOS] for sent in tgt_text]
+    def build_data(self, data_path):
+        with open(data_path, 'r', encoding='utf-8') as f:
+            data = f.read()
+        data = data.strip()
+        data = data.split('\n')
 
-        # pad_sequence对一个batch批次(以单词id表示)的数据进行padding填充对齐长度
-        # 返回[batch, N], N为当前batch最大长度
-        batch_source = pad_sequence([torch.LongTensor(np.array(l_)) for l_ in src_tokens],
-                                    batch_first=True, padding_value=self.PAD)
-        batch_target = pad_sequence([torch.LongTensor(np.array(l_)) for l_ in tgt_tokens],
-                                    batch_first=True, padding_value=self.PAD)
+        # 分割英文数据和中文数据
+        en_data = [line.split('\t')[0] for line in data]
+        ch_data = [line.split('\t')[1] for line in data]
 
-        # decoder要用到的target输入部分
-        dec_input = batch_target[:, :-1]
-        # decoder训练时应预测输出的target结果
-        target = batch_target[:, 1:]
+        # 按字符级切割，并添加<eos>
+        en_token_list = [[char for char in line] + ["<eos>"] for line in en_data]
+        ch_token_list = [[char for char in line] + ["<eos>"] for line in ch_data]
 
-        return batch_source, dec_input, target
+        # 基本字典
+        basic_dict = {'<pad>': 0, '<unk>': 1, '<bos>': 2, '<eos>': 3}
+        # 分别生成中英文字典
+        en_vocab = set(''.join(en_data))
+        en2id = {char: i + len(basic_dict) for i, char in enumerate(en_vocab)}
+        en2id.update(basic_dict)
+        id2en = {v: k for k, v in en2id.items()}
+
+        # 分别生成中英文字典
+        ch_vocab = set(''.join(ch_data))
+        ch2id = {char: i + len(basic_dict) for i, char in enumerate(ch_vocab)}
+        ch2id.update(basic_dict)
+        id2ch = {v: k for k, v in ch2id.items()}
+
+        # 利用字典，映射数据
+        en_num_data = [[en2id[en] for en in line] for line in en_token_list]
+        ch_num_data = [[ch2id[ch] for ch in line] for line in ch_token_list]
+
+        return en_num_data, ch_num_data, en2id, id2en, ch2id, id2ch, basic_dict
+
+    def padding_batch(self, batch):
+        """
+        input: -> list of dict
+            [{'src': [1, 2, 3], 'trg': [1, 2, 3]}, {'src': [1, 2, 2, 3], 'trg': [1, 2, 2, 3]}]
+        output: -> dict of tensor
+            {
+                "src": [[1, 2, 3, 0], [1, 2, 2, 3]].T
+                "trg": [[1, 2, 3, 0], [1, 2, 2, 3]].T
+            }
+        """
+        src_lens = [d["src_len"] for d in batch]
+        trg_lens = [d["trg_len"] for d in batch]
+
+        src_max = max([d["src_len"] for d in batch])
+        trg_max = max([d["trg_len"] for d in batch])
+        for d in batch:
+            d["src"].extend([self.en2id["<pad>"]] * (src_max - d["src_len"]))
+            d["trg"].extend([self.ch2id["<pad>"]] * (trg_max - d["trg_len"]))
+
+        srcs = torch.tensor([pair["src"] for pair in batch], dtype=torch.long, device=config.device)
+        trgs = torch.tensor([pair["trg"] for pair in batch], dtype=torch.long, device=config.device)
+
+        batch = {"src": srcs.T, "src_len": src_lens, "trg": trgs.T, "trg_len": trg_lens}
+        # batch.src/trg的shape为[seq_len, batch_size]
+        return batch
 
 
 if __name__ == '__main__':
-    # 数据预处理
-    dev_dataset = TranslateDataset(config.dev_file)
-    loader = DataLoader(dev_dataset, batch_size=64, shuffle=False, collate_fn=dev_dataset.collate_fn)
-    for i, data in enumerate(loader):
-        if i == 14:
-            enc_input, dec_input, target = data
-            print(enc_input.shape)
-            print(dec_input.shape)
-            print(target.shape)
+
+    # 数据集
+    train_set = TranslationDataset(config.data_path)
+    train_loader = DataLoader(train_set, batch_size=config.batch_size, collate_fn=train_set.padding_batch)
+    for i, batch in enumerate(train_loader):
+        if i == 10:
+            srcs = batch['src']
+            tgts = batch['trg']
+            print(srcs.shape)

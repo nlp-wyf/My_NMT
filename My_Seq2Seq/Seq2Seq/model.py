@@ -3,136 +3,145 @@ import torch
 import torch.nn as nn
 
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-SOS_token = 0  # 开始标志
-EOS_token = 1  # 结束标志
-MAX_LENGTH = 20  # 最大长度
-
-
 class Encoder(nn.Module):
-    def __init__(self, input_dim, embed_dim, hidden_dim, num_layers, dropout=0.5):
-        """
-
-        :param input_dim:  输入源词库的大小
-        :param embed_dim:   输入单词Embedding的维度
-        :param hidden_dim:   隐层的维度
-        :param num_layers:   隐层的层数
-        :param dropout:  dropout参数
-        """
+    def __init__(self, src_vocab_size, embedding_dim, hidden_dim, num_layers, dropout=0.5):
         super(Encoder, self).__init__()
-        # 设置输入参数
-        self.input_dim = input_dim
-        self.embed_dim = embed_dim
+
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
 
-        # 根据input和embbed的的维度，初始化embedding层
-        self.embedding = nn.Embedding(input_dim, embed_dim)
-        # 初始化GRU，获取embbed的输入维度，输出隐层的维度，设置GRU层的参数
-        self.gru = nn.GRU(embed_dim, hidden_dim, num_layers=num_layers, dropout=dropout)
-        self.dropout = nn.Dropout(p=dropout)
+        self.embedding = nn.Embedding(src_vocab_size, embedding_dim)
+        self.gru = nn.GRU(embedding_dim, hidden_dim, num_layers, dropout=dropout)
 
-    def forward(self, src):
-        # src.shape [src_seq_len, batch_size] 这句话的长度和batch大小
+    def forward(self, input_seqs, input_lengths, hidden):
+        # input_seqs = [seq_len, batch]
+        embedded = self.embedding(input_seqs)
+        # embedded = [seq_len, batch, embed_dim]
+        packed = torch.nn.utils.rnn.pack_padded_sequence(embedded, input_lengths, enforce_sorted=False)
 
-        # embedded.shape [src_seq_len, batch_size, embed_dim]
-        # embedded = self.embedding(src).view(1, 1, -1)
-        embedded = self.dropout(self.embedding(src))
-
-        # outputs.shape [src_seq_len, batch_size, hidden_dim * num_directions]
-        # hidden.shape [num_layers * num_directions, batch_size, hidden_dim]
-        outputs, hidden = self.gru(embedded)
+        outputs, hidden = self.gru(packed, hidden)
+        outputs, output_lengths = torch.nn.utils.rnn.pad_packed_sequence(outputs)
+        # outputs = [seq_len, batch, hid_dim * n directions]
+        # output_lengths = [batch]
         return outputs, hidden
 
 
 class Decoder(nn.Module):
-    def __init__(self, output_dim, embed_dim, hidden_dim, num_layers, dropout=0.5):
-        """
-
-        :param output_dim: 输入目标词库的大小
-        :param embed_dim: 输入单词Embedding的维度
-        :param hidden_dim: 隐层的维度
-        :param num_layers: 隐层的层数
-        :param dropout: dropout参数
-        """
+    def __init__(self, tgt_vocab_size, embedding_dim, hidden_dim, num_layers, dropout=0.5):
         super(Decoder, self).__init__()
 
-        # 设置参数
-        self.embed_dim = embed_dim
+        self.tgt_vocab_size = tgt_vocab_size
         self.hidden_dim = hidden_dim
-        self.output_dim = output_dim
         self.num_layers = num_layers
-        self.dropout = nn.Dropout(p=dropout)
 
-        # 以适当的维度，初始化每一层。
-        # decoder层由embedding, GRU, 线性层和Log softmax 激活函数组成
-        self.embedding = nn.Embedding(output_dim, embed_dim)
-        self.gru = nn.GRU(embed_dim, hidden_dim, num_layers=num_layers, dropout=dropout)
-        self.out = nn.Linear(hidden_dim, output_dim)  # 线性层
+        self.embedding = nn.Embedding(tgt_vocab_size, embedding_dim)
+        self.gru = nn.GRU(embedding_dim, hidden_dim, num_layers, dropout=dropout)
 
-    def forward(self, tgt, hidden):
-        # tgt.shape为[1, batch_size]
-        # reshape the tgt to (1, batch_size)
-        tgt = tgt.unsqueeze(0)
-        # tgt = tgt.view(1, -1)
+        self.fc_out = nn.Linear(hidden_dim, tgt_vocab_size)
+        self.dropout = nn.Dropout(dropout)
+        self.softmax = nn.LogSoftmax(dim=1)
 
-        # embedded.shape [1, batch_size, embed_dim]
-        # embedded = F.relu(self.embedding(tgt))
-        embedded = self.dropout(self.embedding(tgt))
+    def forward(self, token_inputs, hidden):
+        # token_inputs = [batch]
+        token_inputs = token_inputs.unsqueeze(0)
+        # [1, batch_size]
+        batch_size = token_inputs.size(1)
+        embedded = self.dropout(self.embedding(token_inputs).view(1, batch_size, -1))
+        # embedded = [1, batch, emb_dim]
 
-        # output.shape [1, batch_size, hidden_dim * num_directions]
-        # hidden.shape [num_layers * num_direction, batch_size, hidden_dim]
         output, hidden = self.gru(embedded, hidden)
+        # output = [1, batch,  n_directions * hid_dim]
+        # hidden = [n_layers * n_directions, batch, hid_dim]
 
-        # output[0].shape == output.squeeze(0)== [batch_size, output_dim]
-        # prediction = self.softmax(self.out(output[0]))
-        prediction = self.out(output.squeeze(0))
-
-        return prediction, hidden
+        output = self.fc_out(output.squeeze(0))
+        output = self.softmax(output)
+        # output = [batch, tgt_vocab_size]
+        return output, hidden
 
 
 class Seq2Seq(nn.Module):
-    def __init__(self, encoder, decoder, device):
-        super().__init__()
+    def __init__(self, encoder, decoder, device, predict=False, basic_dict=None, max_len=100):
+        super(Seq2Seq, self).__init__()
 
-        # 初始化encoder和decoder
-        self.encoder = encoder
-        self.decoder = decoder
         self.device = device
 
-    def forward(self, source, target, teacher_forcing_ratio=0.5):
-        # source.shape [src_seq_len, batch_size]
-        # target.shape [tgt_seq_len, batch_size]
+        self.encoder = encoder
+        self.decoder = decoder
 
-        batch_size = target.shape[1]
-        target_length = target.shape[0]
-        tgt_vocab_size = self.decoder.output_dim
+        self.predict = predict  # 训练阶段还是预测阶段
+        self.basic_dict = basic_dict  # decoder的字典，存放特殊token对应的id
+        self.max_len = max_len  # 翻译时最大输出长度
 
-        # tensor to store decoder outputs
-        outputs = torch.zeros(target_length, batch_size, tgt_vocab_size).to(self.device)
+        assert encoder.hidden_dim == decoder.hidden_dim
+        assert encoder.num_layers == decoder.num_layers
 
-        # 为语句中的每一个word编码
-        # for i in range(source_length):
-        #     encoder_output, encoder_hidden = self.encoder(source[i])
+    def forward(self, input_batches, input_lengths, target_batches=None, target_lengths=None,
+                teacher_forcing_ratio=0.5):
+        # input_batches = target_batches = [seq_len, batch]
+        batch_size = input_batches.size(1)
 
-        encoder_output, encoder_hidden = self.encoder(source)
+        BOS_token = self.basic_dict["<bos>"]
+        EOS_token = self.basic_dict["<eos>"]
+        PAD_token = self.basic_dict["<pad>"]
 
-        # 使用encoder的hidden层作为decoder的hidden层
-        decoder_hidden = encoder_hidden.to(device)
+        # 初始化
+        encoder_hidden = torch.zeros(self.encoder.num_layers, batch_size,
+                                     self.encoder.hidden_dim, device=self.device)
 
-        # 在预测前，添加一个token
-        # decoder_input = torch.tensor([SOS_token], device=device)
-        # decoder的第一个输入是开始标志<sos>
-        decoder_input = target[0, :]
+        # encoder_output = [seq_len, batch, hid_dim * n directions]
+        # encoder_hidden = [n_layers*n_directions, batch, hid_dim]
+        encoder_output, encoder_hidden = self.encoder(input_batches, input_lengths, encoder_hidden)
 
-        for t in range(1, target_length):
-            decoder_output, decoder_hidden = self.decoder(decoder_input, decoder_hidden)
-            outputs[t] = decoder_output
-            # 是否使用Teacher Forcing
-            teacher_force = random.random() < teacher_forcing_ratio
+        # 初始化
+        decoder_input = torch.tensor([BOS_token] * batch_size, dtype=torch.long, device=self.device)
+        # 将encoder的状态值作为decoder的初始状态
+        decoder_hidden = encoder_hidden
 
-            top1 = decoder_output.argmax(1)
+        if self.predict:
+            # 预测阶段使用
+            # 一次只输入一句话
+            assert batch_size == 1
+            output_tokens = []
 
-            decoder_input = target[t] if teacher_force else top1
+            while True:
+                decoder_output, decoder_hidden = self.decoder(decoder_input, decoder_hidden)
+                # topi.shape [1, 1]
+                topv, topi = decoder_output.topk(1)
+                # 上一个预测作为下一个输入
+                decoder_input = topi.squeeze(1)
+                output_token = topi.squeeze().detach().item()
+                if output_token == EOS_token or len(output_tokens) == self.max_len:
+                    break
+                output_tokens.append(output_token)
+            return output_tokens
 
-        return outputs
+        else:
+            # 训练阶段
+            max_target_length = max(target_lengths)
+            all_decoder_outputs = torch.zeros((max_target_length, batch_size, self.decoder.tgt_vocab_size),
+                                              device=self.device)
+
+            for t in range(max_target_length):
+                use_teacher_forcing = True if random.random() < teacher_forcing_ratio else False
+                if use_teacher_forcing:
+                    # decoder_output = [batch, tgt_vocab_size]
+                    # decoder_hidden = [n_layers * n_directions, batch, hid_dim]
+                    decoder_output, decoder_hidden = self.decoder(decoder_input, decoder_hidden)
+                    all_decoder_outputs[t] = decoder_output
+                    decoder_input = target_batches[t]  # 下一个输入来自训练数据
+                else:
+                    decoder_output, decoder_hidden = self.decoder(decoder_input, decoder_hidden)
+                    # topi.shape [batch, 1]
+                    topv, topi = decoder_output.topk(1)
+                    all_decoder_outputs[t] = decoder_output
+                    # 下一个输入来自模型预测
+                    decoder_input = topi.squeeze(1)
+
+            loss_fn = nn.NLLLoss(ignore_index=PAD_token)
+            loss = loss_fn(
+                # [batch_size * seq_len, tgt_vocab_size]
+                all_decoder_outputs.reshape(-1, self.decoder.tgt_vocab_size),
+                # [batch_size * seq_len]
+                target_batches.reshape(-1)
+            )
+            return loss
