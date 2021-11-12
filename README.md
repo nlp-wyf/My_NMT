@@ -6,4 +6,6 @@
 https://github.com/hemingkx/ChineseNMT
 
 ## My_Seq2Seq
-### 使用GRU的简单Seq2Seq
+### 使用GRU(Attention)的简单Seq2Seq
+### 借鉴项目:
+https://gitee.com/dogecheng/python/blob/master/pytorch/Seq2SeqForTranslation.ipynb
