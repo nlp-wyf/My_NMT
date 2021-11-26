@@ -9,3 +9,6 @@ https://github.com/hemingkx/ChineseNMT
 ### 使用GRU(Attention)的简单Seq2Seq
 ### 借鉴项目:
 https://gitee.com/dogecheng/python/blob/master/pytorch/Seq2SeqForTranslation.ipynb
+
+## My_BPE
+### Byte Pair Encoding算法(BPE)实现
